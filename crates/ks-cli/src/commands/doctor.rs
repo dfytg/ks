@@ -4,7 +4,7 @@ use std::io::IsTerminal as _;
 use std::path::Path;
 use std::process::ExitCode;
 
-use ks::{Config, crypto, git, x25519};
+use ks::{Config, Store, crypto, git, x25519};
 use owo_colors::{OwoColorize as _, Stream, Style};
 
 use crate::commands;
@@ -82,6 +82,9 @@ pub fn run(config: &Config) -> ExitCode {
         &recipients_path.display().to_string(),
     );
 
+    if recipients_ok {
+        check_rotation(config, &mut report);
+    }
     check_permissions(config, &mut report);
 
     let identity = check_identity(config, &recipients_path, &mut report);
@@ -236,16 +239,34 @@ fn check_secrets(config: &Config, identity: &x25519::Identity, report: &mut Repo
     );
 }
 
-/// Reports leftover runtime artifacts (interrupted rotation, scratch files) as
-/// non-fatal notes with a cleanup hint.
-fn check_runtime_artifacts(config: &Config, report: &mut Report) {
+/// Detects and self-heals a recipient rotation that a crash interrupted, then
+/// reports what happened. Opening the store is what performs the recovery, so
+/// the remaining checks afterwards always see a consistent store.
+fn check_rotation(config: &Config, report: &mut Report) {
     let staging = config.store_dir.join(".ks-rotate");
-    if staging.exists() {
-        report.note(&format!(
-            "leftover rotation staging at {} — safe to delete (a rotation was interrupted)",
-            staging.display()
-        ));
+    if !staging.exists() {
+        return;
     }
+    let rolled_forward = staging.join("READY").exists();
+    match Store::open(config.clone()) {
+        Ok(_) => {
+            let action = if rolled_forward {
+                "rolled forward to completion"
+            } else {
+                "rolled back (store was untouched)"
+            };
+            report.note(&format!(
+                "recovered an interrupted recipient rotation: {action}"
+            ));
+        }
+        Err(e) => report.check("recover interrupted rotation", false, &e.to_string()),
+    }
+}
+
+/// Reports leftover scratch files from an interrupted atomic write as non-fatal
+/// notes with a cleanup hint. (Interrupted rotations are handled by
+/// [`check_rotation`], which self-heals them.)
+fn check_runtime_artifacts(config: &Config, report: &mut Report) {
     let temps = orphan_temp_count(&config.store_dir);
     if temps > 0 {
         report.note(&format!(

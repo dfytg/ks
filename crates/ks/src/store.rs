@@ -38,6 +38,17 @@ const LOCK_FILE: &str = ".ks.lock";
 /// Name of the staging directory used for transactional recipient rotation.
 const ROTATE_DIR: &str = ".ks-rotate";
 
+/// Subdirectory inside [`ROTATE_DIR`] mirroring the re-encrypted secret tree.
+const ROTATE_SECRETS: &str = "secrets";
+
+/// Staged target recipient list, written inside [`ROTATE_DIR`] during phase 1.
+const ROTATE_RECIPIENTS: &str = "RECIPIENTS";
+
+/// Commit-point marker written last in phase 1. Its presence means the staging
+/// area is complete and a crash must be rolled *forward*; its absence means a
+/// crash must be rolled *back*.
+const ROTATE_READY: &str = "READY";
+
 /// An encrypted store bound to a config and its recipient list.
 pub struct Store {
     config: Config,
@@ -53,6 +64,17 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// Outcome of [`Store::recover_rotation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationRecovery {
+    /// No interrupted rotation was found; the store was already consistent.
+    Clean,
+    /// An incomplete preparation was discarded; the live store was untouched.
+    RolledBack,
+    /// A committed-but-interrupted rotation was rolled forward to completion.
+    Completed,
+}
+
 impl Store {
     /// Opens an existing store and loads its recipients. Does **not** unlock the
     /// identity, so the returned store can write but not yet read secrets.
@@ -66,7 +88,14 @@ impl Store {
             return Err(Error::StoreNotFound(config.store_dir));
         }
         let recipients = crypto::load_recipients(&config.recipients_path())?;
-        Ok(Self { config, recipients })
+        let mut store = Self { config, recipients };
+        // Self-heal a rotation a previous run may have crashed mid-way, then
+        // reload recipients in case rolling forward flipped them.
+        if store.staging_dir().exists() {
+            store.recover_rotation()?;
+            store.recipients = crypto::load_recipients(&store.config.recipients_path())?;
+        }
+        Ok(store)
     }
 
     /// Creates a brand-new store, writing `.age-recipients` with the owner's
@@ -301,13 +330,14 @@ impl Store {
     /// `new_recipients` must include `identity`'s public key, otherwise the user
     /// would lock themselves out.
     ///
-    /// Rotation is two-phase: every secret is first re-encrypted into a staging
-    /// directory, and only once *all* succeed are the staged files moved over the
-    /// live ones (the recipients file last). A failure during preparation (e.g. a
-    /// tampered secret) therefore leaves the live store completely untouched. A
-    /// crash during the short commit phase can leave a mix of old/new secrets, but
-    /// every file is always a complete ciphertext the identity can decrypt, so
-    /// re-running converges.
+    /// Rotation is crash-consistent. Phase 1 re-encrypts every secret into a
+    /// `.ks-rotate` staging tree, records the target recipients, and finally
+    /// drops a `READY` marker — the commit point. Phase 2 moves the staged files
+    /// over the live ones and flips the recipients file. A crash *before* `READY`
+    /// rolls back (the live store was never touched); a crash *after* it rolls
+    /// forward, because phase 2 is idempotent. Recovery runs automatically on the
+    /// next [`open`](Store::open) and can be invoked via
+    /// [`recover_rotation`](Store::recover_rotation).
     ///
     /// # Errors
     /// [`Error::InvalidRecipient`] if the user's own key is missing, or
@@ -325,34 +355,35 @@ impl Store {
         let mut lock = RwLock::new(self.lock_file()?);
         let _guard = lock.write().map_err(Error::Io)?;
 
+        // Finish or discard a rotation an earlier crash may have left behind
+        // before staging a new one, so staging areas never stack.
+        self.rollforward_or_back()?;
+
         let paths = self.list("")?;
-        let staging = self.config.store_dir.join(ROTATE_DIR);
+        let staging = self.staging_dir();
         remove_staging(&staging);
 
-        // Phase 1 — prepare: re-encrypt every secret into the staging area. Any
-        // failure here leaves the live store untouched.
+        // Phase 1 — prepare: stage every re-encrypted secret, record the target
+        // recipients, then drop the READY marker. A crash before READY exists
+        // leaves the live store untouched (rolled back on next open).
         if let Err(e) = self.stage_rotation(&paths, &staging, &new_recipients, identity) {
             remove_staging(&staging);
             return Err(e);
         }
 
-        // Phase 2 — commit: move each staged file over its live counterpart,
-        // flip the recipients file last, then drop the staging area.
-        for path in &paths {
-            crypto::rename_replace(
-                &pathutil::to_file(&staging, path),
-                &pathutil::to_file(&self.config.store_dir, path),
-            )?;
-        }
-        crypto::save_recipients(&self.config.recipients_path(), &new_recipients)?;
-        remove_staging(&staging);
+        // Phase 2 — commit: idempotent and replayable. A crash after READY
+        // exists is rolled forward on next open.
+        self.commit_staged(&staging)?;
 
         self.recipients = new_recipients;
         Ok(paths.len())
     }
 
-    /// Re-encrypts every secret in `paths` to `new_recipients`, writing the
-    /// ciphertext into the `staging` mirror tree. Phase 1 of [`set_recipients`].
+    /// Phase 1 of [`set_recipients`]: re-encrypts every secret in `paths` to
+    /// `new_recipients` under `staging/secrets`, records the target recipient
+    /// list, then drops the `READY` commit marker. Once this returns `Ok`, the
+    /// staged rotation is durable and [`commit_staged`](Store::commit_staged) can
+    /// finish (or replay) it.
     fn stage_rotation(
         &self,
         paths: &[String],
@@ -360,12 +391,78 @@ impl Store {
         new_recipients: &[x25519::Recipient],
         identity: &x25519::Identity,
     ) -> Result<()> {
+        let secrets = staging.join(ROTATE_SECRETS);
         for path in paths {
             let secret = self.get(path, identity)?;
             let wrapped = envelope::wrap(path, secret.kind(), secret.as_bytes());
             let ciphertext = crypto::encrypt(&wrapped, new_recipients)?;
-            crypto::write_atomic(&pathutil::to_file(staging, path), &ciphertext)?;
+            crypto::write_atomic(&pathutil::to_file(&secrets, path), &ciphertext)?;
         }
+        crypto::save_recipients(&staging.join(ROTATE_RECIPIENTS), new_recipients)?;
+        // READY is written last: its presence proves the staging tree above is
+        // complete and durable.
+        crypto::write_atomic(&staging.join(ROTATE_READY), b"")?;
+        Ok(())
+    }
+
+    /// Path to the rotation staging directory (`<store>/.ks-rotate`).
+    fn staging_dir(&self) -> PathBuf {
+        self.config.store_dir.join(ROTATE_DIR)
+    }
+
+    /// Detects and resolves a recipient rotation that a crash interrupted,
+    /// taking the store write lock. A no-op when no staging area is present, so
+    /// it is cheap to call on every [`open`](Store::open).
+    ///
+    /// A rotation that crashed *before* its `READY` commit point is rolled back
+    /// (the live store was never modified); one that crashed *after* it is rolled
+    /// forward to completion. Both directions are idempotent.
+    ///
+    /// # Errors
+    /// [`Error::Io`] on lock or filesystem failure, or [`Error::NoRecipients`] /
+    /// [`Error::InvalidRecipient`] if a staged recipient list cannot be parsed
+    /// while rolling forward.
+    pub fn recover_rotation(&self) -> Result<RotationRecovery> {
+        self.with_write_lock(|| self.rollforward_or_back())
+    }
+
+    /// Resolves any pending rotation. The caller must already hold the write
+    /// lock (via [`with_write_lock`](Store::with_write_lock)).
+    fn rollforward_or_back(&self) -> Result<RotationRecovery> {
+        let staging = self.staging_dir();
+        if !staging.exists() {
+            return Ok(RotationRecovery::Clean);
+        }
+        if staging.join(ROTATE_READY).exists() {
+            self.commit_staged(&staging)?;
+            Ok(RotationRecovery::Completed)
+        } else {
+            // Preparation never reached its commit point; phase 1 never touches
+            // the live store, so discarding the staging area is a full rollback.
+            remove_staging(&staging);
+            Ok(RotationRecovery::RolledBack)
+        }
+    }
+
+    /// Phase 2 of a rotation: moves every staged ciphertext over its live
+    /// counterpart, flips the recipients file to the staged target, and clears
+    /// the staging area. Idempotent, so a crash mid-commit is fixed by replaying
+    /// it. The caller must hold the write lock.
+    fn commit_staged(&self, staging: &Path) -> Result<()> {
+        let secrets = staging.join(ROTATE_SECRETS);
+        let mut paths = Vec::new();
+        if secrets.exists() {
+            walk(&secrets, &secrets, &mut paths)?;
+        }
+        for path in &paths {
+            crypto::rename_replace(
+                &pathutil::to_file(&secrets, path),
+                &pathutil::to_file(&self.config.store_dir, path),
+            )?;
+        }
+        let target = crypto::load_recipients(&staging.join(ROTATE_RECIPIENTS))?;
+        crypto::save_recipients(&self.config.recipients_path(), &target)?;
+        remove_staging(staging);
         Ok(())
     }
 
@@ -588,5 +685,75 @@ mod tests {
         );
         assert!(!cfg.store_dir.join(".ks-rotate").exists());
         assert_eq!(store.get("a", &id).expect("get a").password(), "va");
+    }
+
+    #[test]
+    fn rotation_crash_after_ready_rolls_forward() {
+        let (cfg, id) = fresh();
+        let store = Store::create(cfg.clone(), &id, &[]).expect("create");
+        store.set("k", &Secret::new("v")).expect("set");
+
+        // Simulate a crash *after* the READY commit point: phase 1 is fully
+        // staged but phase 2 (moving files, flipping recipients) never ran.
+        let backup = x25519::Identity::generate();
+        let target = vec![id.to_public(), backup.to_public()];
+        let staging = store.staging_dir();
+        store
+            .stage_rotation(&["k".to_owned()], &staging, &target, &id)
+            .expect("stage");
+        assert!(staging.join(ROTATE_READY).exists());
+        // The live store is still on the old recipients: backup cannot read it.
+        assert!(store.get("k", &backup).is_err());
+        drop(store);
+
+        // Opening the store must roll the rotation forward to completion.
+        let recovered = Store::open(cfg.clone()).expect("open recovers");
+        assert!(
+            !staging.exists(),
+            "staging must be cleared after roll-forward"
+        );
+        assert_eq!(recovered.get("k", &id).expect("get").password(), "v");
+        assert_eq!(
+            recovered.get("k", &backup).expect("backup get").password(),
+            "v",
+            "the new recipient must be able to decrypt after roll-forward"
+        );
+        let recips = crypto::load_recipients(&cfg.recipients_path()).expect("recips");
+        assert!(crypto::recipients_contain(&recips, &backup.to_public()));
+        // Recovery is idempotent: a second pass finds nothing to do.
+        assert_eq!(
+            recovered.recover_rotation().expect("idempotent"),
+            RotationRecovery::Clean
+        );
+    }
+
+    #[test]
+    fn rotation_crash_before_ready_rolls_back() {
+        let (cfg, id) = fresh();
+        let store = Store::create(cfg.clone(), &id, &[]).expect("create");
+        store.set("k", &Secret::new("v")).expect("set");
+        let live_before = std::fs::read(pathutil::to_file(&cfg.store_dir, "k")).expect("read");
+
+        // Simulate a crash *before* the commit point by staging then deleting
+        // READY, leaving an incomplete preparation behind.
+        let backup = x25519::Identity::generate();
+        let target = vec![id.to_public(), backup.to_public()];
+        let staging = store.staging_dir();
+        store
+            .stage_rotation(&["k".to_owned()], &staging, &target, &id)
+            .expect("stage");
+        std::fs::remove_file(staging.join(ROTATE_READY)).expect("drop ready");
+        drop(store);
+
+        let recovered = Store::open(cfg.clone()).expect("open rolls back");
+        assert!(!staging.exists(), "incomplete staging must be discarded");
+        let live_after = std::fs::read(pathutil::to_file(&cfg.store_dir, "k")).expect("read");
+        assert_eq!(live_before, live_after, "live store must be untouched");
+        let recips = crypto::load_recipients(&cfg.recipients_path()).expect("recips");
+        assert!(
+            !crypto::recipients_contain(&recips, &backup.to_public()),
+            "a rolled-back rotation must not change recipients"
+        );
+        assert_eq!(recovered.get("k", &id).expect("get").password(), "v");
     }
 }

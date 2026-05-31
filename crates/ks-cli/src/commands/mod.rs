@@ -26,6 +26,7 @@ pub mod recipients;
 pub mod rm;
 pub mod run;
 pub mod show;
+pub mod sync;
 
 /// Dispatches a parsed [`Cli`] to the matching command implementation.
 ///
@@ -70,8 +71,9 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Otp { path, copy } => otp::run(cfg, &path, copy),
         Command::Run { env, prefix, cmd } => run::run(cfg, &env, &prefix, &cmd),
         Command::Recipients { cmd } => recipients::run(cfg, cmd),
-        Command::Identity => identity::run(cfg),
+        Command::Identity { action } => identity::run(cfg, action),
         Command::Git { args } => git::run(cfg, &args),
+        Command::Sync { message } => sync::run(cfg, &message),
         Command::Doctor => Ok(doctor::run(cfg)),
         Command::Passwd => passwd::run(cfg),
     };
@@ -97,8 +99,9 @@ fn audit_descriptor(command: &Command) -> (&'static str, String) {
         Command::Otp { path, .. } => ("otp", path.clone()),
         Command::Run { .. } => ("run", String::new()),
         Command::Recipients { .. } => ("recipients", String::new()),
-        Command::Identity => ("identity", String::new()),
+        Command::Identity { .. } => ("identity", String::new()),
         Command::Git { .. } => ("git", String::new()),
+        Command::Sync { .. } => ("sync", String::new()),
         Command::Doctor => ("doctor", String::new()),
         Command::Passwd => ("passwd", String::new()),
     }

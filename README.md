@@ -1,5 +1,3 @@
-<!-- markdownlint-disable MD033 MD041 MD036 -->
-
 # ks
 
 [![Crates.io][crates-badge]][crates-url]
@@ -33,6 +31,7 @@ ks keeps API tokens, SSH/DB passphrases, TOTP seeds and CI secrets encrypted on 
 - **One file per secret** — clean `git diff`s, conflicts scoped to a single key, synced over plain git with no server.
 - **Tamper-evident** — every secret is sealed in a path-bound envelope, so a relocated, swapped or rolled-back file is rejected on read.
 - **Hardened by default** — secrets live in `Zeroizing` memory; the process disables core dumps, denies debuggers and (on Unix) locks pages out of swap; writes are atomic and lock-serialised.
+- **Built to sync** — one-step `ks sync`, offline key backup/restore, and crash-consistent recipient rotation that self-heals after an interruption.
 - **Agent-friendly** — a global `--json` flag turns every command non-interactive and machine-readable.
 - **Batteries included** — built-in TOTP, subprocess injection, and an optional audit log.
 
@@ -82,10 +81,10 @@ ks otp github/totp -c
 ks run --env github/pat=GITHUB_TOKEN -- npm test
 ks run --prefix aws -- terraform apply        # AWS_ACCESS_KEY=…, AWS_SECRET_KEY=…
 
-# Sync across devices with plain git
-ks identity                                   # this device's age1… public key
-ks recipients add age1xyz…                    # re-encrypt the store to a new device
-ks git push                                   # passthrough, runs inside the store
+# Back up your key, then sync across devices with plain git
+ks identity export --out ks-identity.age      # offline backup of your (encrypted) key
+ks sync                                        # commit + pull --rebase + push, in one step
+ks recipients add age1xyz…                    # authorise another device's public key
 
 # Maintenance
 ks doctor                                     # health-check
@@ -159,18 +158,41 @@ Secret paths are slash-separated; each segment allows ASCII letters, digits, `_`
 | **Memory** | `Zeroizing` on every secret-bearing type; cleared on drop |
 | **Files** | `0o600` files / `0o700` dirs on Unix, created with `O_EXCL`; startup self-check warns on group/world access |
 | **Process** | core dumps disabled, debugger attachment denied, pages locked out of swap (Unix); crash dumps suppressed (Windows) |
-| **Concurrency** | store-wide advisory write lock; recipient rotation staged then committed |
+| **Concurrency** | store-wide advisory write lock; recipient rotation is crash-consistent — staged behind a commit marker and self-healed (rolled forward or back) on next open |
 | **Unlocked key** | never written to disk or a keyring; lives only in process memory |
 
 **Roadmap:** YubiKey / PIV (`age-plugin-yubikey`) and post-quantum recipients (`age-plugin-pq`) — the `identity.age` format is already plugin-ready.
 
-## Multi-Device
+## Backup & Multi-Device
 
-1. On the new device, run `ks init` and copy its public key (`ks identity`).
-2. On a trusted device, `ks recipients add <new-pubkey>` — every secret is re-encrypted to the union of recipients.
-3. `git pull` on the new device.
+`identity.age` is the **only** key that can decrypt your store, and it is *never* pushed to git — losing it loses everything. Back it up before you store anything important.
 
-Revoke a lost device with `ks recipients rm <pubkey>`, then rotate any exposed secrets — no cryptography can revoke past reads.
+**Back up the key once, keep it offline:**
+
+```sh
+ks identity export --out ks-identity.age   # encrypted copy (still needs your passphrase)
+ks identity export --armor                 # …or ASCII text to paste into a password manager
+```
+
+The backup stays passphrase-protected, so it is safe at rest in a password manager or on an offline drive — just not next to the git remote.
+
+**Run a second device** (recommended — no single point of failure):
+
+```sh
+ks identity import ks-identity.age   # restore the same key on the new device
+ks sync                              # commit + pull --rebase + push, in one step
+```
+
+Prefer one key per device? Authorise each instead of sharing:
+
+```sh
+ks recipients add <new-device-pubkey>   # re-encrypts every secret to the union, then `ks sync`
+ks recipients rm  <lost-device-pubkey>  # revoke, then rotate any exposed secrets
+```
+
+`ks sync` stages, commits, rebases and pushes in one step, so you can never push without committing. The `.age-recipients` list uses git's `union` merge and recipient rotation is crash-consistent, so concurrent edits from two devices converge instead of corrupting the store.
+
+> First push to a new remote sets the upstream once (`ks git push -u origin main`); use `ks sync` after that. Revoking a key cannot undo past reads — always rotate exposed secrets too.
 
 ## License
 
@@ -191,7 +213,6 @@ A **[QNTX](https://qntx.fun)** open-source project.
 
 <a href="https://qntx.fun"><img alt="QNTX" width="369" src="https://raw.githubusercontent.com/qntx/.github/main/profile/qntx-banner.svg" /></a>
 
-<!--prettier-ignore-->
 Code is law. We write both.
 
 </div>

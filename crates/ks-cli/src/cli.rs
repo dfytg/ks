@@ -1,5 +1,7 @@
 //! Clap-derive command-line parser.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use ks::pwgen::Charset;
 
@@ -157,8 +159,11 @@ pub enum Command {
         cmd: RecipientsCmd,
     },
 
-    /// Print this device's public recipient (`age1…`).
-    Identity,
+    /// Show this device's public recipient, or back up / restore the identity.
+    Identity {
+        #[command(subcommand)]
+        action: Option<IdentityAction>,
+    },
 
     /// Run git inside the store directory (passthrough): `ks git <args…>`.
     #[command(disable_help_flag = true)]
@@ -166,6 +171,13 @@ pub enum Command {
         /// Arguments forwarded verbatim to the system `git`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Commit, pull (rebase) and push the store in one step.
+    Sync {
+        /// Commit message for any staged local changes.
+        #[arg(short, long, default_value = "ks sync")]
+        message: String,
     },
 
     /// Run a battery of health checks on the store and config.
@@ -196,5 +208,29 @@ pub enum RecipientsCmd {
     Rm {
         /// `age1…` public key.
         pubkey: String,
+    },
+}
+
+/// Subcommands of `ks identity`.
+#[derive(Debug, Subcommand)]
+pub enum IdentityAction {
+    /// Back up the encrypted identity (still passphrase-protected) for offline
+    /// storage or to bootstrap another device.
+    Export {
+        /// Write to this file instead of stdout.
+        #[arg(short, long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// ASCII-armor the output (printable; always on when writing to stdout).
+        #[arg(short, long)]
+        armor: bool,
+    },
+    /// Restore the identity from a backup made with `ks identity export`.
+    Import {
+        /// Read from this file instead of stdin.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Overwrite an existing identity file.
+        #[arg(short, long)]
+        force: bool,
     },
 }

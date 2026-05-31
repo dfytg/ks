@@ -101,8 +101,15 @@ pub fn load_identity(path: &Path, passphrase: SecretString) -> Result<x25519::Id
     if !path.exists() {
         return Err(Error::IdentityNotFound(path.to_path_buf()));
     }
-    let ciphertext = std::fs::read(path)?;
-    let plaintext = decrypt_with_passphrase(&ciphertext, passphrase)?;
+    identity_from_ciphertext(&std::fs::read(path)?, passphrase)
+}
+
+/// Decrypts a passphrase-protected identity container and extracts its key.
+fn identity_from_ciphertext(
+    ciphertext: &[u8],
+    passphrase: SecretString,
+) -> Result<x25519::Identity> {
+    let plaintext = decrypt_with_passphrase(ciphertext, passphrase)?;
     parse_identity(&plaintext)
 }
 
@@ -118,8 +125,99 @@ pub fn change_passphrase(path: &Path, current: SecretString, new: SecretString) 
     Ok(())
 }
 
-/// Parses a recipients-file body into public keys, preserving order and
-/// stripping `#` comments and blank lines.
+/// Writes a backup copy of the encrypted identity at `src` to `dst`.
+///
+/// The copy is still passphrase-protected age — exporting never exposes the
+/// secret key in the clear. With `armor`, the copy is ASCII-armored (printable /
+/// pasteable); otherwise the raw bytes are copied verbatim. The destination is
+/// created owner-only and must not already exist.
+///
+/// # Errors
+/// [`Error::IdentityNotFound`] if `src` is absent, [`Error::IdentityExists`] if
+/// `dst` already exists, or [`Error::Io`] / [`Error::Encrypt`] on failure.
+pub fn export_identity(src: &Path, dst: &Path, armor: bool) -> Result<()> {
+    if !src.exists() {
+        return Err(Error::IdentityNotFound(src.to_path_buf()));
+    }
+    if dst.exists() {
+        return Err(Error::IdentityExists(dst.to_path_buf()));
+    }
+    let raw = std::fs::read(src)?;
+    let bytes = if armor { to_armor(&raw)? } else { raw };
+    write_atomic(dst, &bytes)
+}
+
+/// Returns the encrypted identity at `src` as ASCII-armored age text, suitable
+/// for printing and storing in a password manager. Still passphrase-protected.
+///
+/// # Errors
+/// [`Error::IdentityNotFound`] if `src` is absent, or [`Error::Io`] /
+/// [`Error::Encrypt`] on failure.
+pub fn armored_identity(src: &Path) -> Result<String> {
+    if !src.exists() {
+        return Err(Error::IdentityNotFound(src.to_path_buf()));
+    }
+    let armored = to_armor(&std::fs::read(src)?)?;
+    String::from_utf8(armored)
+        .map_err(|e| Error::Encrypt(format!("armored identity is not valid UTF-8: {e}")))
+}
+
+/// Restores an identity from a backup (binary or ASCII-armored) into `dst`.
+///
+/// Validates that `passphrase` decrypts the backup *before* writing. The restored
+/// file is always canonical binary age, created owner-only. Refuses to overwrite
+/// an existing identity unless `force` is set. Returns the unlocked identity so
+/// the caller can confirm the public key.
+///
+/// # Errors
+/// [`Error::WrongPassphrase`] if the passphrase does not match the backup,
+/// [`Error::IdentityExists`] if `dst` exists and `force` is false, or
+/// [`Error::Decrypt`] / [`Error::Io`] on other failures.
+pub fn import_identity(
+    backup: &[u8],
+    dst: &Path,
+    passphrase: SecretString,
+    force: bool,
+) -> Result<x25519::Identity> {
+    let raw = from_armor(backup)?;
+    let identity = identity_from_ciphertext(&raw, passphrase)?;
+    if dst.exists() && !force {
+        return Err(Error::IdentityExists(dst.to_path_buf()));
+    }
+    write_atomic(dst, &raw)?;
+    Ok(identity)
+}
+
+/// ASCII-armors raw age bytes for printable backup.
+fn to_armor(raw: &[u8]) -> Result<Vec<u8>> {
+    use age::armor::{ArmoredWriter, Format};
+    let mut out = Vec::with_capacity(raw.len());
+    let mut writer = ArmoredWriter::wrap_output(&mut out, Format::AsciiArmor)
+        .map_err(|e| Error::Encrypt(e.to_string()))?;
+    writer
+        .write_all(raw)
+        .map_err(|e| Error::Encrypt(e.to_string()))?;
+    writer.finish().map_err(|e| Error::Encrypt(e.to_string()))?;
+    Ok(out)
+}
+
+/// De-armors age input when it is ASCII-armored, otherwise passes the binary
+/// bytes through unchanged.
+fn from_armor(input: &[u8]) -> Result<Vec<u8>> {
+    use age::armor::ArmoredReader;
+    let mut reader = ArmoredReader::new(input);
+    let mut out = Vec::with_capacity(input.len());
+    reader
+        .read_to_end(&mut out)
+        .map_err(|e| Error::Decrypt(e.to_string()))?;
+    Ok(out)
+}
+
+/// Parses a recipients-file body into unique public keys.
+///
+/// Strips `#` comments and blank lines. Duplicates — which a git `merge=union`
+/// resolution of concurrent edits can introduce — are collapsed, keeping
+/// first-seen order.
 ///
 /// # Errors
 /// Returns [`Error::InvalidRecipient`] if a non-comment line fails to parse.
@@ -132,7 +230,9 @@ pub fn parse_recipients(text: &str) -> Result<Vec<x25519::Recipient>> {
         }
         let recipient = x25519::Recipient::from_str(line)
             .map_err(|e| Error::InvalidRecipient(format!("line {}: {e}", idx.saturating_add(1))))?;
-        out.push(recipient);
+        if !recipients_contain(&out, &recipient) {
+            out.push(recipient);
+        }
     }
     Ok(out)
 }
@@ -153,17 +253,23 @@ pub fn load_recipients(path: &Path) -> Result<Vec<x25519::Recipient>> {
     Ok(recipients)
 }
 
-/// Atomically writes the recipients file at `path` with a header comment.
+/// Atomically writes the recipients file at `path`, sorted and de-duplicated.
+///
+/// A canonical on-disk form keeps git diffs minimal and lets a `merge=union`
+/// resolution of concurrent edits converge cleanly.
 ///
 /// # Errors
 /// Returns [`Error::Io`] on any filesystem failure.
 pub fn save_recipients(path: &Path, recipients: &[x25519::Recipient]) -> Result<()> {
+    let mut keys: Vec<String> = recipients.iter().map(ToString::to_string).collect();
+    keys.sort_unstable();
+    keys.dedup();
     let mut body = String::from(
         "# ks recipients — public keys allowed to decrypt this store.\n\
          # Add one with `ks recipients add <age1...>`.\n",
     );
-    for r in recipients {
-        body.push_str(&r.to_string());
+    for key in &keys {
+        body.push_str(key);
         body.push('\n');
     }
     write_atomic(path, body.as_bytes())
@@ -398,6 +504,95 @@ mod tests {
     }
 
     #[test]
+    fn identity_export_import_roundtrip_binary() {
+        let dir = tempdir();
+        let src = dir.join("identity.age");
+        let pp = SecretString::from("backup-pw".to_owned());
+        let created = create_identity(&src, pp.clone()).expect("create");
+
+        let backup = dir.join("backup.age");
+        export_identity(&src, &backup, false).expect("export");
+        assert!(
+            matches!(
+                export_identity(&src, &backup, false),
+                Err(Error::IdentityExists(_))
+            ),
+            "export must refuse to overwrite an existing backup"
+        );
+
+        let restored_path = dir.join("restored.age");
+        let bytes = std::fs::read(&backup).expect("read backup");
+        let restored = import_identity(&bytes, &restored_path, pp, false).expect("import");
+        assert_eq!(
+            created.to_public().to_string(),
+            restored.to_public().to_string()
+        );
+        load_identity(&restored_path, SecretString::from("backup-pw".to_owned()))
+            .expect("restored identity loads normally");
+    }
+
+    #[test]
+    fn identity_export_import_roundtrip_armored() {
+        let dir = tempdir();
+        let src = dir.join("identity.age");
+        let pp = SecretString::from("backup-pw".to_owned());
+        let created = create_identity(&src, pp.clone()).expect("create");
+
+        let armored = armored_identity(&src).expect("armor");
+        assert!(
+            armored.contains("BEGIN AGE ENCRYPTED FILE"),
+            "armored output must carry the age armor header"
+        );
+
+        let restored_path = dir.join("restored.age");
+        let restored =
+            import_identity(armored.as_bytes(), &restored_path, pp, false).expect("import armored");
+        assert_eq!(
+            created.to_public().to_string(),
+            restored.to_public().to_string()
+        );
+    }
+
+    #[test]
+    fn identity_import_rejects_wrong_passphrase() {
+        let dir = tempdir();
+        let src = dir.join("identity.age");
+        create_identity(&src, SecretString::from("right".to_owned())).expect("create");
+        let bytes = std::fs::read(&src).expect("read");
+        let restored = dir.join("restored.age");
+        let err = import_identity(
+            &bytes,
+            &restored,
+            SecretString::from("wrong".to_owned()),
+            false,
+        )
+        .err()
+        .expect("must fail");
+        assert!(matches!(err, Error::WrongPassphrase));
+        assert!(
+            !restored.exists(),
+            "a failed import must not write the destination"
+        );
+    }
+
+    #[test]
+    fn identity_import_refuses_overwrite_without_force() {
+        let dir = tempdir();
+        let src = dir.join("identity.age");
+        let pp = SecretString::from("pw".to_owned());
+        create_identity(&src, pp.clone()).expect("create");
+        let bytes = std::fs::read(&src).expect("read");
+        let dst = dir.join("existing.age");
+        std::fs::write(&dst, b"do not clobber").expect("write existing");
+        assert!(matches!(
+            import_identity(&bytes, &dst, pp.clone(), false),
+            Err(Error::IdentityExists(_))
+        ));
+        import_identity(&bytes, &dst, pp, true).expect("force import");
+        load_identity(&dst, SecretString::from("pw".to_owned())).expect("load forced");
+    }
+
+    #[test]
     fn recipients_parse_skips_comments() {
         let id = x25519::Identity::generate();
         let pubkey = id.to_public().to_string();
@@ -420,5 +615,33 @@ mod tests {
     #[test]
     fn recipients_reject_invalid() {
         assert!(parse_recipients("not-a-key").is_err());
+    }
+
+    #[test]
+    fn recipients_parse_collapses_duplicates() {
+        let pubkey = x25519::Identity::generate().to_public().to_string();
+        // A git `merge=union` resolution can leave the same key twice.
+        let parsed = parse_recipients(&format!("{pubkey}\n{pubkey}\n")).expect("parse");
+        assert_eq!(parsed.len(), 1, "duplicate keys must be collapsed");
+    }
+
+    #[test]
+    fn recipients_save_is_sorted_and_deduped() {
+        let path = tempdir().join(".age-recipients");
+        let a = x25519::Identity::generate().to_public();
+        let b = x25519::Identity::generate().to_public();
+        save_recipients(&path, &[b.clone(), a, b]).expect("save");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let keys: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(keys.len(), 2, "duplicates must be removed on save");
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            keys, sorted,
+            "keys must be written in canonical sorted order"
+        );
     }
 }

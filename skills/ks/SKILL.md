@@ -31,7 +31,7 @@ Or via Cargo: `cargo install ks-cli`. Verify with `ks --version`.
 ## Agent Setup — read this first
 
 1. **`--json` is global and means "fully non-interactive".** Put it anywhere: `ks --json show github/token`. Output is a single JSON object on **stdout**, no colors, no prompts.
-2. **Unlocking requires `KS_PASSPHRASE`.** Any command that reads plaintext (`show`, `grep --values`, `otp`, `run`, `identity`, `recipients add/rm`, `mv`, `cp`) or creates the identity (`init`) needs it. In `--json` mode the passphrase **must** come from `KS_PASSPHRASE`; there is no prompt. It is read once and then scrubbed from the process environment.
+2. **Unlocking requires `KS_PASSPHRASE`.** Any command that reads plaintext (`show`, `grep --values`, `otp`, `run`, `identity`, `recipients add/rm`, `mv`, `cp`) or creates/restores the identity (`init`, `identity import`) needs it. In `--json` mode the passphrase **must** come from `KS_PASSPHRASE`; there is no prompt. It is read once and then scrubbed from the process environment.
 3. **Destructive operations need `--force`** in `--json` mode: `rm`, and overwriting an existing secret via `insert`/`gen`. Without `--force` they return an error instead of prompting.
 4. **Provide secret values on stdin** (pipe). `insert` reads stdin in `--json` mode.
 5. **Errors** are `{"error": "<message>"}` on stdout with a non-zero exit code.
@@ -64,7 +64,10 @@ ks [--json] <command> [options]
 | `run -e P=NAME … -- <cmd>` |         | Run a subprocess with secrets injected as env vars                                       | yes              |
 | `recipients ls\|add\|rm`   |         | Manage the recipient public-key list                                                     | add/rm           |
 | `identity`                 |         | Print this device's `age1…` public key                                                   | yes              |
-| `doctor`                   |         | Health-check the store                                                                   | optional         |
+| `identity export`          |         | Back up the encrypted identity: `--out <path>` (file) or `--armor` (stdout)              | no               |
+| `identity import [path]`   |         | Restore the identity from a backup (file or stdin). `-f/--force` to overwrite            | passphrase       |
+| `sync [-m <msg>]`          |         | `git add -A` + commit + `pull --rebase` + push, in one step                              | no               |
+| `doctor`                   |         | Health-check the store (self-heals an interrupted rotation)                              | optional         |
 | `git <args…>`              |         | Run git inside the store (passthrough)                                                   | no               |
 | `edit <path>`              |         | Edit in `$EDITOR` (**interactive only**)                                                 | yes              |
 | `passwd`                   |         | Rotate the identity passphrase (**interactive only**)                                    | yes              |
@@ -134,6 +137,15 @@ Always use `--json` for programmatic use. Each command prints one object.
 { "recipients": ["age1…", "age1…"] }
 { "added": "age1…", "reencrypted": 12 }
 { "removed": "age1…", "reencrypted": 12 }
+
+// identity export --out <path>   /   identity export --armor (stdout)
+{ "exported": "/path/ks-identity.age", "armor": false }
+{ "identity": "-----BEGIN AGE ENCRYPTED FILE-----\n…" }
+// identity import   (reads file arg or stdin; needs KS_PASSPHRASE)
+{ "identity_path": "…", "public_key": "age1…" }
+
+// sync
+{ "synced": true, "store_dir": "…", "message": "ks sync" }
 
 // doctor
 { "checks": [ { "check": "identity unlocks", "ok": true, "detail": "…" } ],

@@ -18,8 +18,12 @@ pub fn is_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
-/// Initialises a git repository at `dir` and writes a sensible `.gitattributes`
-/// that marks `*.age` as binary so git does not try to diff ciphertext.
+/// Initialises a git repository at `dir` with a sensible `.gitattributes`.
+///
+/// `*.age` is marked binary so git never diffs or line-merges ciphertext, and
+/// the plaintext `.age-recipients` list uses `merge=union` so concurrent edits
+/// from different devices combine instead of conflicting (the store
+/// canonicalises the file on its next write).
 ///
 /// # Errors
 /// Returns [`Error::Command`] if `git init` fails or [`Error::Io`] on write.
@@ -30,7 +34,7 @@ pub fn init(dir: &Path) -> Result<()> {
     if !gitattributes.exists() {
         std::fs::write(
             &gitattributes,
-            "*.age binary -diff -merge\n.age-recipients text\n",
+            "*.age binary -diff -merge\n.age-recipients merge=union\n",
         )?;
     }
     let gitignore = dir.join(".gitignore");
