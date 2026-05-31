@@ -35,11 +35,10 @@ pub fn run(config: &Config, env: &[String], prefix: &[String], cmd: &[String]) -
         }
         for path in paths {
             let secret = store.get(&path, &identity)?;
-            let suffix = path
-                .strip_prefix(pfx)
-                .and_then(|s| s.strip_prefix('/'))
-                .unwrap_or(&path);
-            let env_name = suffix.replace(['/', '-'], "_").to_uppercase();
+            // Keep the full logical path in the variable name (`aws/access_key`
+            // -> `AWS_ACCESS_KEY`) so prefixes stay namespaced and two different
+            // prefixes can never collide on the same suffix.
+            let env_name = path.replace(['/', '-'], "_").to_uppercase();
             injected.push((env_name, Zeroizing::new(secret.password().to_owned())));
         }
     }
