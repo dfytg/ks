@@ -42,6 +42,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"
 [profile.release]
 codegen-units = 1
 lto = "thin"
+# `abort` shrinks the binary and avoids unwinding through secret-bearing frames,
+# but it also skips `Drop`, so `Zeroizing` buffers are NOT scrubbed on a panic.
+# Accepted because the process is panic-light and the hardening profile already
+# disables core dumps / swap, so abandoned plaintext pages are not persisted.
 panic = "abort"
 strip = true
 

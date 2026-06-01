@@ -129,7 +129,9 @@ Always use `--json` for programmatic use. Each command prints one object.
 { "from": "github/pat", "to": "backup/pat", "copied": true }
 
 // grep / otp / identity
-{ "query": "github", "matches": ["github/token"] }
+// `unreadable` lists paths skipped during a --values scan because they could not
+// be decrypted or failed envelope verification (tampered/corrupt); usually empty.
+{ "query": "github", "matches": ["github/token"], "unreadable": [] }
 { "path": "github/totp", "code": "123456", "valid_for_secs": 23 }
 { "public_key": "age1…" }
 

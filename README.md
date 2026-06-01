@@ -161,6 +161,8 @@ Secret paths are slash-separated; each segment allows ASCII letters, digits, `_`
 | **Concurrency** | store-wide advisory write lock; recipient rotation is crash-consistent — staged behind a commit marker and self-healed (rolled forward or back) on next open |
 | **Unlocked key** | never written to disk or a keyring; lives only in process memory |
 
+**Subprocess injection caveat:** `ks run` passes secrets through the child's **environment** — this keeps them off disk, but a process environment is not a sandbox. It is readable by other processes running as the same user (e.g. `/proc/<pid>/environ` on Linux) and is inherited by every descendant the child spawns. Prefer it to a committed `.env` file, but treat anything injected this way as visible to your own user session.
+
 **Roadmap:** YubiKey / PIV (`age-plugin-yubikey`) and post-quantum recipients (`age-plugin-pq`) — the `identity.age` format is already plugin-ready.
 
 ## Backup & Multi-Device

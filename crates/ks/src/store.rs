@@ -75,6 +75,17 @@ pub enum RotationRecovery {
     Completed,
 }
 
+/// Outcome of [`Store::grep`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GrepResults {
+    /// Paths that matched by name, or by decrypted content under a value scan.
+    pub matches: Vec<String>,
+    /// Paths skipped during a content scan because they could not be decrypted
+    /// or failed envelope verification (tampered, corrupt, or not encrypted to
+    /// this identity). Always empty when `identity` is `None`.
+    pub unreadable: Vec<String>,
+}
+
 impl Store {
     /// Opens an existing store and loads its recipients. Does **not** unlock the
     /// identity, so the returned store can write but not yet read secrets.
@@ -305,24 +316,31 @@ impl Store {
     /// Searches paths (always) and decrypted contents (when `identity` is
     /// `Some`) case-insensitively for `query`.
     ///
+    /// Secrets that fail to decrypt or verify during a content scan are not
+    /// silently ignored — a tampered or corrupt secret would otherwise be
+    /// invisible to search. Their paths are returned in
+    /// [`GrepResults::unreadable`] so the caller can surface them.
+    ///
     /// # Errors
-    /// [`Error::Io`] / [`Error::Decrypt`] on failure when scanning contents.
-    pub fn grep(&self, query: &str, identity: Option<&x25519::Identity>) -> Result<Vec<String>> {
+    /// [`Error::Io`] if the store directory cannot be listed.
+    pub fn grep(&self, query: &str, identity: Option<&x25519::Identity>) -> Result<GrepResults> {
         let needle = query.to_lowercase();
-        let mut hits = Vec::new();
+        let mut results = GrepResults::default();
         for path in self.list("")? {
             if path.to_lowercase().contains(&needle) {
-                hits.push(path);
+                results.matches.push(path);
                 continue;
             }
-            if let Some(id) = identity
-                && let Ok(secret) = self.get(&path, id)
-                && secret.expose().to_lowercase().contains(&needle)
-            {
-                hits.push(path);
+            let Some(id) = identity else { continue };
+            match self.get(&path, id) {
+                Ok(secret) if secret.expose().to_lowercase().contains(&needle) => {
+                    results.matches.push(path);
+                }
+                Ok(_) => {}
+                Err(_) => results.unreadable.push(path),
             }
         }
-        Ok(hits)
+        Ok(results)
     }
 
     /// Replaces the recipient list and re-encrypts every secret to it.
@@ -479,9 +497,9 @@ impl Store {
             return Err(Error::SecretExists(to.to_owned()));
         }
         let dst = pathutil::to_file(&self.config.store_dir, to);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // The destination directory is created securely (0o700) by `write_atomic`
+        // when `reencrypt_to` writes `dst`; creating it here would be redundant and
+        // would use the looser default mode.
         Ok((src, dst))
     }
 }
@@ -629,14 +647,38 @@ mod tests {
             .expect("s2");
 
         assert_eq!(
-            store.grep("github", None).expect("grep"),
+            store.grep("github", None).expect("grep").matches,
             vec!["github/token"]
         );
-        assert!(store.grep("eu-west", None).expect("grep").is_empty());
+        assert!(
+            store
+                .grep("eu-west", None)
+                .expect("grep")
+                .matches
+                .is_empty()
+        );
         assert_eq!(
-            store.grep("eu-west", Some(&id)).expect("grep values"),
+            store
+                .grep("eu-west", Some(&id))
+                .expect("grep values")
+                .matches,
             vec!["aws/key"]
         );
+    }
+
+    #[test]
+    fn grep_values_reports_unreadable_secrets() {
+        let (cfg, id) = fresh();
+        let store = Store::create(cfg.clone(), &id, &[]).expect("create");
+        store.set("ok", &Secret::new("findme")).expect("ok");
+        store.set("broken", &Secret::new("findme")).expect("broken");
+
+        // Corrupt one ciphertext so it can no longer be decrypted.
+        std::fs::write(pathutil::to_file(&cfg.store_dir, "broken"), b"not age").expect("corrupt");
+
+        let res = store.grep("findme", Some(&id)).expect("grep values");
+        assert_eq!(res.matches, vec!["ok"]);
+        assert_eq!(res.unreadable, vec!["broken"]);
     }
 
     #[test]

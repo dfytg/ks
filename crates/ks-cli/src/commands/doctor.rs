@@ -200,12 +200,15 @@ fn check_identity(
 /// Flags any identity/store/recipients path readable by group or other (Unix).
 fn check_permissions(config: &Config, report: &mut Report) {
     let issues = config.permission_issues();
-    if issues.is_empty() {
-        report.check("file permissions owner-only", true, "ok");
-    } else {
+    if !issues.is_empty() {
         for issue in &issues {
             report.check("file permissions", false, issue);
         }
+    } else if cfg!(unix) {
+        report.check("file permissions owner-only", true, "ok");
+    } else {
+        // No POSIX mode bits to inspect; report honestly rather than a false "ok".
+        report.note("file permissions: not enforced on this platform (Windows ACLs out of scope)");
     }
 }
 

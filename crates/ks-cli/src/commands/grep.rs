@@ -15,16 +15,25 @@ pub fn run(config: &Config, query: &str, values: bool) -> Result<ExitCode> {
         None
     };
 
-    let hits = store.grep(query, identity.as_ref())?;
+    let results = store.grep(query, identity.as_ref())?;
     if crate::output::is_json() {
-        crate::output::emit(&serde_json::json!({ "query": query, "matches": hits }));
+        crate::output::emit(&serde_json::json!({
+            "query": query,
+            "matches": results.matches,
+            "unreadable": results.unreadable,
+        }));
         return Ok(ExitCode::SUCCESS);
     }
-    if hits.is_empty() {
+    // Surface secrets that could not be decrypted/verified rather than dropping
+    // them: a tampered or corrupt secret would otherwise be invisible to search.
+    for path in &results.unreadable {
+        terminal::warn(&format!("{path}: could not decrypt or verify (skipped)"));
+    }
+    if results.matches.is_empty() {
         terminal::warn("No matches");
         return Ok(ExitCode::SUCCESS);
     }
-    for path in hits {
+    for path in results.matches {
         println!("{path}");
     }
     Ok(ExitCode::SUCCESS)
