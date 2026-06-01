@@ -30,7 +30,7 @@ pub enum Command {
     },
 
     /// List secrets as a tree.
-    #[command(alias = "list")]
+    #[command(alias = "list", visible_alias = "l")]
     Ls {
         /// Only list paths under this prefix.
         #[arg(default_value = "")]
@@ -38,7 +38,7 @@ pub enum Command {
     },
 
     /// Print a secret (whole file), or copy/extract part of it.
-    #[command(alias = "get")]
+    #[command(alias = "get", visible_alias = "s")]
     Show {
         /// Logical secret path (e.g. `github/token`).
         path: String,
@@ -54,7 +54,7 @@ pub enum Command {
     },
 
     /// Store or update a secret (masked prompt, or stdin when piped).
-    #[command(alias = "set")]
+    #[command(alias = "set", visible_alias = "i")]
     Insert {
         /// Logical secret path.
         path: String,
@@ -70,12 +70,14 @@ pub enum Command {
     },
 
     /// Edit a secret in `$EDITOR`.
+    #[command(visible_alias = "e")]
     Edit {
         /// Logical secret path.
         path: String,
     },
 
     /// Generate a random secret and optionally store it.
+    #[command(visible_alias = "g")]
     Gen {
         /// Logical path to store the generated value (omit to print only).
         path: Option<String>,
@@ -120,7 +122,7 @@ pub enum Command {
     },
 
     /// Search secrets by path, and optionally by decrypted content.
-    #[command(alias = "find")]
+    #[command(alias = "find", visible_alias = "f")]
     Grep {
         /// Query string (case-insensitive substring match).
         query: String,
@@ -130,6 +132,7 @@ pub enum Command {
     },
 
     /// Generate a TOTP code from a secret containing an `otpauth://` source.
+    #[command(visible_alias = "o")]
     Otp {
         /// Logical path of a TOTP secret.
         path: String,
@@ -139,7 +142,7 @@ pub enum Command {
     },
 
     /// Run a command with secrets injected as environment variables.
-    #[command(trailing_var_arg = true)]
+    #[command(trailing_var_arg = true, visible_alias = "r")]
     Run {
         /// Mapping `<path>=<ENV_NAME>` (repeatable).
         #[arg(short, long, value_name = "PATH=NAME")]
@@ -154,6 +157,7 @@ pub enum Command {
     },
 
     /// Manage the recipient public-key list.
+    #[command(visible_alias = "rec")]
     Recipients {
         #[command(subcommand)]
         cmd: RecipientsCmd,
@@ -174,6 +178,7 @@ pub enum Command {
     },
 
     /// Commit, pull (rebase) and push the store in one step.
+    #[command(visible_alias = "sy")]
     Sync {
         /// Commit message for any staged local changes.
         #[arg(short, long, default_value = "ks sync")]

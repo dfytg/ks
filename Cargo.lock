@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "ks"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "age",
  "directories",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "ks-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arboard",
  "base64 0.22.1",
