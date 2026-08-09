@@ -22,6 +22,21 @@ run:
 test:
     cargo test --workspace --all-features
 
+# Supply-chain policy (also CI security.yml)
+deny:
+    cargo deny check
+
+# Ultimate CLI coverage matrix (real binary; ~1–3 min)
+test-ultimate:
+    cargo test -p ks-cli --test e2e_ultimate -- --nocapture
+
+# All ks-cli real-binary e2e (json + security + multidevice + ultimate)
+test-e2e:
+    cargo test -p ks-cli --test json --test e2e_security --test multidevice --test e2e_ultimate -- --nocapture
+
+# Full automated gates + ultimate matrix
+test-all: test test-ultimate deny
+
 # Run benchmarks with all features enabled
 bench:
     cargo bench --all-features

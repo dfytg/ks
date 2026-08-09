@@ -16,16 +16,21 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PASS: &str = "integration-pass-123456";
+
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ks-json-it-{}-{nanos}", std::process::id()));
+    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("ks-json-it-{}-{}-{seq}", std::process::id(), nanos));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

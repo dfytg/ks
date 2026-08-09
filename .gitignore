@@ -25,3 +25,6 @@ target
 
 # Local agent scratch
 .claude/
+
+# macOS
+.DS_Store

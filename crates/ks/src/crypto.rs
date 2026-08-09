@@ -438,6 +438,9 @@ fn fsync_dir(dir: &Path) {
     }
 }
 
+/// On non-Unix platforms (notably Windows), directory fsync is a no-op: the
+/// file payload is still `sync_all`'d before rename, but rename durability is
+/// weaker than on Unix. Documented accepted limitation for this release.
 #[cfg(not(unix))]
 const fn fsync_dir(_dir: &Path) {}
 

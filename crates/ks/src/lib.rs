@@ -9,10 +9,10 @@
 //!   the user's passphrase with age scrypt mode. Stays local.
 //! - **Recipients** (`store/.age-recipients`): a plaintext list of `age1…`
 //!   public keys allowed to decrypt this store. Git-synced with the secrets.
-//! - **Secrets** (`store/<path>.age`): each secret is its own
-//!   recipient-encrypted age file whose plaintext is just text — the first line
-//!   is the value, `key: value` lines are fields. `age -d secret.age` is
-//!   human-readable and interoperable with the `age` / `rage` CLIs.
+//! - **Secrets** (`store/<path>.age`): each secret is its own recipient-encrypted
+//!   age file. The age plaintext is a path- and generation-bound envelope
+//!   (`ksenv/2`); the payload is text (first line = value, `key: value` fields)
+//!   or raw binary. Interoperable with `age` / `rage` for the outer layer.
 //!
 //! ## Asymmetry
 //!
@@ -45,6 +45,8 @@ pub mod crypto;
 mod envelope;
 /// Library-wide error and result types.
 pub mod error;
+/// Per-path generation index (`.ks-generations`).
+mod generations;
 /// Thin wrapper over the system `git` binary.
 pub mod git;
 /// Logical secret path validation.
@@ -62,4 +64,19 @@ pub use age::x25519;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use secret::{Secret, SecretKind};
-pub use store::{RotationRecovery, Store};
+pub use store::{GenerationCensus, MoveRecovery, RepairReport, RotationRecovery, Store};
+
+/// Hidden helpers for optional out-of-tree fuzz targets (`--features fuzzing`).
+/// Not part of the stable public API.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    /// Feed arbitrary bytes to envelope unwrap (must not panic).
+    pub fn fuzz_envelope_unwrap(data: &[u8]) {
+        drop(crate::envelope::unwrap("fuzz/path", data));
+    }
+
+    /// Feed arbitrary bytes to the generations index parser (must not panic).
+    pub fn fuzz_generations_parse(data: &[u8]) {
+        drop(crate::generations::parse(data));
+    }
+}

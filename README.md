@@ -27,11 +27,11 @@ ks keeps API tokens, SSH/DB passphrases, TOTP seeds and CI secrets encrypted on 
 
 - **Write without unlocking** — `insert`, `gen`, `rm` and `ls` need only public keys; only *reading* a secret unlocks the identity.
 - **Modern crypto, zero PGP** — X25519 + ChaCha20-Poly1305 via `age`; identities and secrets interoperate with the [`age`] / [`rage`] CLIs.
-- **Plain-text payloads** — first line is the value, `key: value` lines are fields; `age -d secret.age` stays human-readable, no bespoke container.
+- **Readable sealed payloads** — after `age -d`, plaintext is a small `ksenv/2` envelope (kind, path, generation) plus the secret body: first line is the value, `key: value` lines are fields.
 - **One file per secret** — clean `git diff`s, conflicts scoped to a single key, synced over plain git with no server.
-- **Tamper-evident** — every secret is sealed in a path-bound envelope, so a relocated, swapped or rolled-back file is rejected on read.
-- **Hardened by default** — secrets live in `Zeroizing` memory; the process disables core dumps, denies debuggers and (on Unix) locks pages out of swap; writes are atomic and lock-serialised.
-- **Built to sync** — one-step `ks sync`, offline key backup/restore, and crash-consistent recipient rotation that self-heals after an interruption.
+- **Tamper-evident** — every secret is sealed in a path-bound envelope (path + generation). Relocated or swapped files are rejected; older ciphertext under a newer generation index is rejected (partial temporal integrity — see Security).
+- **Hardened by default** — secrets live in `Zeroizing` memory; the process disables core dumps, denies debuggers and (on Unix) locks pages out of swap (best-effort; `ks doctor` reports status); writes are atomic and lock-serialised.
+- **Built to sync** — one-step `ks sync`, offline key backup/restore, and crash-consistent recipient rotation / rename journals that recover only with an authenticated unlock (not on bare open).
 - **Agent-friendly** — a global `--json` flag turns every command non-interactive and machine-readable.
 - **Batteries included** — built-in TOTP, subprocess injection, and an optional audit log.
 
@@ -131,12 +131,26 @@ $XDG_DATA_HOME/ks/
 ├── logs/audit.jsonl      # optional metadata-only audit log (KS_AUDIT=1)
 └── store/                # git root — safe to push
     ├── .age-recipients   # plaintext public-key allow-list
+    ├── .ks-generations   # path → generation (git-synced; merge=union)
     ├── .ks.lock          # advisory write lock (git-ignored)
+    ├── .ks-rotate/       # recipient-rotation staging (git-ignored)
+    ├── .ks-move/         # rename staging (git-ignored)
     └── github/
-        └── token.age     # age envelope: path header + value + `key: value` fields
+        └── token.age     # age ciphertext; plaintext envelope ksenv/2 (path + generation + payload)
 ```
 
 Secret paths are slash-separated; each segment allows ASCII letters, digits, `_`, `-` and `.` (so `aws/credentials.json` is stored intact) — never path traversal or reserved Windows names.
+
+**Generation skew recovery**
+
+| Situation | Action |
+| --- | --- |
+| Index lag (envelope gen &gt; index) | `ks doctor --repair-generations` |
+| Stale, single device (keep ciphertext) | `ks doctor --repair-generations` then local `get` works |
+| Stale, multi-device, known plaintext | `ks set` / `insert` **while the high index is still present** (writes `H+1`). **Do not repair first** |
+| Unreadable / corrupt ciphertext | `ks rm <path>` then re-insert from known plaintext — not `mv`/`cp`/rotate |
+
+Repair never weakens P1 on reads. Co-rolled secret+index restore remains undetectable (N1).
 
 | Variable | Purpose |
 | --- | --- |
@@ -144,6 +158,7 @@ Secret paths are slash-separated; each segment allows ASCII letters, digits, `_`
 | `KS_PASSPHRASE` | Non-interactive unlock (CI); read once, then scrubbed from the environment |
 | `KS_CLIP_TIME` | Clipboard auto-clear delay in seconds (default `45`) |
 | `KS_AUDIT` | `1` enables the append-only audit log |
+| `KS_STRICT_HARDEN` | `1` aborts startup if core-dump disable or debugger denial fails (Unix) |
 | `NO_COLOR` | Disable colour (already off when output is piped) |
 
 ## Security
@@ -154,16 +169,30 @@ Secret paths are slash-separated; each segment allows ASCII letters, digits, `_`
 | --- | --- |
 | **Identity at rest** | `age` scrypt over a bech32 X25519 secret key |
 | **Secrets at rest** | `age` X25519 recipient mode (ChaCha20-Poly1305 + HKDF) |
-| **Integrity** | per-secret, path-bound envelope; relocation or rollback is rejected on read |
-| **Memory** | `Zeroizing` on every secret-bearing type; cleared on drop |
-| **Files** | `0o600` files / `0o700` dirs on Unix, created with `O_EXCL`; startup self-check warns on group/world access |
-| **Process** | core dumps disabled, debugger attachment denied, pages locked out of swap (Unix); crash dumps suppressed (Windows) |
-| **Concurrency** | store-wide advisory write lock; recipient rotation is crash-consistent — staged behind a commit marker and self-healed (rolled forward or back) on next open |
+| **Integrity (path)** | per-secret path-bound envelope; relocated or swapped files are rejected on read |
+| **Integrity (temporal, partial)** | sealed envelope generation + git-synced `.ks-generations` (`merge=union`, max-reduce); **older** ciphertext under a **newer** index is rejected (P1). Restoring a coherent older secret **and** matching index line, or any full older git commit, is **not** detected (N1 — same as intentional restore) |
+| **Memory** | `Zeroizing` on every secret-bearing type; cleared on drop. Release builds use `panic = "abort"`, so Drop is skipped on panic (accepted: core dumps/swap hardened) |
+| **Files** | `0o600` files / `0o700` dirs on Unix, created with `O_EXCL`; parent-dir fsync is Unix-only (Windows: file `sync_all` only). Startup self-check warns on group/world access |
+| **Process** | best-effort: core dumps disabled, debugger attachment denied, pages locked out of swap (Unix); crash dumps suppressed (Windows). `ks doctor` reports each measure; `KS_STRICT_HARDEN=1` fails closed on critical Unix measures |
+| **Concurrency** | store-wide advisory write lock; recipient rotation and rename use crash-consistent READY staging and self-heal on next open |
 | **Unlocked key** | never written to disk or a keyring; lives only in process memory |
 
-**Subprocess injection caveat:** `ks run` passes secrets through the child's **environment** — this keeps them off disk, but a process environment is not a sandbox. It is readable by other processes running as the same user (e.g. `/proc/<pid>/environ` on Linux) and is inherited by every descendant the child spawns. Prefer it to a committed `.env` file, but treat anything injected this way as visible to your own user session.
+**Disclosure surfaces (by design):**
+
+- `ks show` / `show --json` print plaintext on stdout — do not log or redirect carelessly.
+- `ks run` injects secrets via the child **environment** — readable by same-user processes (e.g. `/proc/<pid>/environ`) and inherited by every descendant. Prefer it to a committed `.env`, but treat injected values as visible to your user session.
+- `ks edit` writes a short-lived owner-only temp file for `$EDITOR`, then zero-fills and deletes it — residual data may remain on SSDs (not secure erase).
+- Clipboard copy auto-clears best-effort via a detached helper (secret on stdin, never argv); if the helper fails to spawn, the value may remain on the clipboard.
 
 **Roadmap:** YubiKey / PIV (`age-plugin-yubikey`) and post-quantum recipients (`age-plugin-pq`) — the `identity.age` format is already plugin-ready.
+
+### Production readiness (0.7.x)
+
+**Ready for:** local-first storage, multi-device git sync among **trusted** collaborators, threat models that accept same-user disclosure surfaces and non-property **N1**.
+
+**Not a claim of:** independent security audit, compliance attestation, anti-rollback against co-rolled secret+index history, hardware-bound or post-quantum recipients (not implemented), or hostile same-user multi-process isolation without OS sandboxing.
+
+**Gates:** `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check` (CI + weekly). See [CHANGELOG.md](CHANGELOG.md) for 0.7 breaking changes and upgrade steps from 0.6.
 
 ## Backup & Multi-Device
 

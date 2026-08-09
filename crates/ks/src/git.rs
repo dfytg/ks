@@ -12,39 +12,96 @@ use crate::error::{Error, Result};
 
 const BIN: &str = "git";
 
+/// Lines required in `.gitattributes` for a modern ks store.
+const REQUIRED_ATTRIBUTES: &[&str] = &[
+    "*.age binary -diff -merge",
+    ".age-recipients text eol=lf merge=union",
+    ".ks-generations text eol=lf merge=union",
+];
+
+/// Lines required in `.gitignore` for a modern ks store.
+const REQUIRED_IGNORE: &[&str] = &[".ks.lock", ".ks-rotate/", ".ks-move/", "*.tmp"];
+
+/// What [`ensure_git_templates`] added or found missing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TemplateDelta {
+    /// Attribute lines that were appended.
+    pub attributes_added: Vec<String>,
+    /// Ignore lines that were appended.
+    pub ignore_added: Vec<String>,
+}
+
 /// Returns `true` if `dir` contains a `.git` directory or file.
 #[must_use]
 pub fn is_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
-/// Initialises a git repository at `dir` with a sensible `.gitattributes`.
-///
-/// `*.age` is marked binary so git never diffs or line-merges ciphertext. The
-/// plaintext `.age-recipients` list is pinned to LF and uses `merge=union`, so
-/// concurrent edits from different devices combine instead of conflicting and
-/// never churn line endings across platforms (the store canonicalises the file
-/// on its next write).
+/// Initialises a git repository at `dir` with a sensible `.gitattributes` and
+/// `.gitignore`.
 ///
 /// # Errors
 /// Returns [`Error::Command`] if `git init` fails or [`Error::Io`] on write.
 pub fn init(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     run(dir, &["init", "--initial-branch=main"])?;
-    let gitattributes = dir.join(".gitattributes");
-    if !gitattributes.exists() {
-        std::fs::write(
-            &gitattributes,
-            "*.age binary -diff -merge\n.age-recipients text eol=lf merge=union\n",
-        )?;
-    }
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        // Local-only runtime files that must never be committed: the advisory
-        // lock, atomic-write scratch files, and the rotation staging area.
-        std::fs::write(&gitignore, ".ks.lock\n.ks-rotate/\n*.tmp\n")?;
-    }
+    ensure_git_templates(dir)?;
     Ok(())
+}
+
+/// Ensures store git templates contain all required modern lines.
+///
+/// Appends **missing** lines only; never rewrites user comments or existing
+/// order. Creates the file with the full modern template when absent.
+/// Call from [`crate::store::Store::create`], [`init`], or `ks doctor` — not
+/// from [`crate::store::Store::open`] (open must not mutate policy files).
+///
+/// # Errors
+/// [`Error::Io`] on filesystem failure.
+pub fn ensure_git_templates(dir: &Path) -> Result<TemplateDelta> {
+    Ok(TemplateDelta {
+        attributes_added: ensure_lines(&dir.join(".gitattributes"), REQUIRED_ATTRIBUTES)?,
+        ignore_added: ensure_lines(&dir.join(".gitignore"), REQUIRED_IGNORE)?,
+    })
+}
+
+/// Ensures each of `required` appears as a full line in `path` (create or append).
+fn ensure_lines(path: &Path, required: &[&str]) -> Result<Vec<String>> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let present: std::collections::HashSet<&str> = existing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut added = Vec::new();
+    let mut append = String::new();
+    for line in required {
+        if !present.contains(line) {
+            append.push_str(line);
+            append.push('\n');
+            added.push((*line).to_owned());
+        }
+    }
+    if added.is_empty() {
+        return Ok(added);
+    }
+
+    if existing.is_empty() {
+        std::fs::write(path, append)?;
+    } else {
+        let mut body = existing;
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&append);
+        std::fs::write(path, body)?;
+    }
+    Ok(added)
 }
 
 /// `git add -A`.
@@ -139,4 +196,35 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_templates_appends_missing_lines() {
+        let root = std::env::temp_dir().join(format!("ks-git-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).expect("dir");
+        std::fs::write(
+            root.join(".gitattributes"),
+            "*.age binary -diff -merge\n.age-recipients text eol=lf merge=union\n",
+        )
+        .expect("attr");
+        std::fs::write(root.join(".gitignore"), ".ks.lock\n.ks-rotate/\n*.tmp\n").expect("ign");
+
+        let delta = ensure_git_templates(&root).expect("ensure");
+        assert!(
+            delta
+                .attributes_added
+                .iter()
+                .any(|l| l.contains(".ks-generations"))
+        );
+        assert!(delta.ignore_added.iter().any(|l| l.contains(".ks-move")));
+
+        let again = ensure_git_templates(&root).expect("idempotent");
+        assert!(again.attributes_added.is_empty());
+        assert!(again.ignore_added.is_empty());
+        drop(std::fs::remove_dir_all(&root));
+    }
 }

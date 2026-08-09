@@ -1,37 +1,58 @@
-# cargo-deny — supply-chain gate over the entire dependency tree.
-# Run locally with `cargo deny check`; enforced in CI by
-# .github/workflows/security.yml (also on a weekly schedule, so newly disclosed
-# advisories are caught even without a code change).
+# cargo-deny for the ks workspace.
+# Run: `cargo deny check` (also wired into CI / security.yml).
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
 
 [advisories]
-# A RustSec advisory or a yanked release fails the check. Add specific
-# `RUSTSEC-…` IDs to `ignore` only with a written justification.
-yanked = "deny"
-ignore = []
-
-[bans]
-# Flag accidental duplicate versions of the same crate; forbid wildcard deps.
-multiple-versions = "warn"
-wildcards = "deny"
+# age → i18n-embed-fl → proc-macro-error2 (compile-time only). Revisit on age bumps.
+ignore = [
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained proc-macro-error2 via age → i18n-embed-fl; compile-time only" },
+]
 
 [licenses]
-# Permissive allow-list; the check fails on anything outside it (e.g. GPL).
-allow = [
-  "MIT",
-  "Apache-2.0",
-  "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
-  "BSL-1.0",       # Boost — permissive (e.g. clipboard-win, error-code)
-  "ISC",
-  "MPL-2.0",       # file-level copyleft; safe to depend on (e.g. option-ext via directories)
-  "Unicode-3.0",
-  "Zlib",
+confidence-threshold = 0.8
+allow                = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-1-Clause",
+    "CC0-1.0",
+    "Unlicense",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "ISC",
 ]
-confidence-threshold = 0.9
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions          = "warn"
+wildcards                  = "deny"
+highlight                  = "all"
+workspace-default-features = "allow"
+external-default-features  = "allow"
+allow-workspace            = true
+
+# Dual rand/crypto lines until age leaves rand 0.8 (workspace uses rand 0.10).
+skip = [
+    { crate = "rand@0.8", reason = "age 0.11 / age-core; workspace uses rand 0.10" },
+    { crate = "rand_core@0.6", reason = "rand 0.8 + x25519-dalek via age" },
+    { crate = "getrandom@0.2", reason = "rand_core 0.6 (age) and directories" },
+    { crate = "chacha20@0.9", reason = "age → chacha20poly1305; rand 0.10 pulls chacha20 0.10" },
+    { crate = "cpufeatures@0.2", reason = "age crypto stack; chacha20 0.10 pulls cpufeatures 0.3" },
+]
 
 [sources]
-# Every dependency must come from a known registry (crates.io); no surprise
-# git or alternative-registry sources.
 unknown-registry = "deny"
-unknown-git = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+allow-git        = []

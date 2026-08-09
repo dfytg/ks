@@ -18,7 +18,7 @@ pub fn run(
 ) -> Result<ExitCode> {
     let store = commands::open_store(config)?;
     let identity = commands::unlock(config)?;
-    let secret = store.get(path, &identity)?;
+    let secret = commands::get_secret(&store, path, &identity)?;
 
     if crate::output::is_json() {
         return show_json(path, &secret, field, meta);

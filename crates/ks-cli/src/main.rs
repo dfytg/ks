@@ -23,7 +23,17 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
-    hardening::harden();
+    let status = hardening::harden();
+    if hardening::strict_requested() && !status.satisfies_strict() {
+        eprintln!(
+            "ks: KS_STRICT_HARDEN=1 but critical process hardening failed \
+             (core_dump={}, debugger_deny={})",
+            status.core_dump.detail(),
+            status.debugger_deny.detail()
+        );
+        return ExitCode::from(1);
+    }
+
     // Detached clipboard-clear helper: `ks __clipclear <secs>`, spawned by
     // `clipboard::copy_with_autoclear`. Handled before clap so it never appears
     // in the public command surface.
