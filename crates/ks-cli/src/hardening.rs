@@ -32,6 +32,14 @@ pub enum Measure {
     /// Measure applied successfully.
     Applied,
     /// Not applicable on this platform/build (with reason).
+    ///
+    /// Constructed on macOS (debug builds), Windows, and non-linux/unix targets;
+    /// on Linux release/CI every measure is Applied/Failed, so rustc would
+    /// otherwise flag this variant as dead under `-D warnings`.
+    #[allow(
+        dead_code,
+        reason = "constructed on non-linux platforms and in unit tests; Linux CI only hits Applied/Failed"
+    )]
     Skipped(&'static str),
     /// Attempted but failed (with short reason).
     Failed(String),
