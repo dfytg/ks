@@ -8,6 +8,7 @@ use ks::{Config, Store, crypto, git, x25519};
 use owo_colors::{OwoColorize as _, Stream, Style};
 
 use crate::commands;
+use crate::hardening;
 
 /// Accumulates check results so they can be rendered as human lines (printed
 /// inline as they run) or a single JSON object at the end.
@@ -59,8 +60,10 @@ impl Report {
     }
 }
 
-pub fn run(config: &Config) -> ExitCode {
+pub fn run(config: &Config, repair_generations: bool) -> ExitCode {
     let mut report = Report::default();
+
+    report_hardening(&mut report);
 
     report.check(
         "identity file present",
@@ -82,13 +85,22 @@ pub fn run(config: &Config) -> ExitCode {
         &recipients_path.display().to_string(),
     );
 
+    // Incomplete (no READY) journals are discarded on open; READY needs identity.
     if recipients_ok {
-        check_rotation(config, &mut report);
+        match Store::open(config.clone()) {
+            Ok(_) => note_pending_journals(config, &mut report),
+            Err(e) => report.check("open store", false, &e.to_string()),
+        }
     }
     check_permissions(config, &mut report);
+    check_git_templates(config, &mut report);
 
     let identity = check_identity(config, &recipients_path, &mut report);
     if let Some(identity) = &identity {
+        recover_ready_journals(config, identity, &mut report);
+        // Repair before sample decrypt so --repair-generations can clear lag/stale
+        // that would otherwise fail the secrets check in the same run.
+        check_generations(config, identity, repair_generations, &mut report);
         check_secrets(config, identity, &mut report);
     }
 
@@ -98,8 +110,162 @@ pub fn run(config: &Config) -> ExitCode {
     finish(&report)
 }
 
-/// Emits the final summary (JSON object, or a coloured pass/fail line) and maps
-/// to the process exit code.
+fn report_hardening(report: &mut Report) {
+    let Some(status) = hardening::status() else {
+        report.note("process hardening: status unavailable");
+        return;
+    };
+    report.check(
+        "hardening core_dump",
+        status.core_dump.is_ok(),
+        &status.core_dump.detail(),
+    );
+    // mlock is informational — failure is common in containers and never fatal.
+    report.note(&format!(
+        "hardening mlock ({}): {}",
+        status.platform,
+        status.mlock.detail()
+    ));
+    report.check(
+        "hardening debugger_deny",
+        status.debugger_deny.is_ok(),
+        &status.debugger_deny.detail(),
+    );
+}
+
+fn check_git_templates(config: &Config, report: &mut Report) {
+    match git::ensure_git_templates(&config.store_dir) {
+        Ok(delta) => {
+            if delta.attributes_added.is_empty() && delta.ignore_added.is_empty() {
+                report.check("git templates current", true, "ok");
+            } else {
+                let mut parts = Vec::new();
+                if !delta.attributes_added.is_empty() {
+                    parts.push(format!(
+                        "appended attributes: {}",
+                        delta.attributes_added.join(", ")
+                    ));
+                }
+                if !delta.ignore_added.is_empty() {
+                    parts.push(format!(
+                        "appended ignore: {}",
+                        delta.ignore_added.join(", ")
+                    ));
+                }
+                report.note(&parts.join("; "));
+            }
+        }
+        Err(e) => report.check("git templates", false, &e.to_string()),
+    }
+}
+
+fn check_generations(
+    config: &Config,
+    identity: &x25519::Identity,
+    repair: bool,
+    report: &mut Report,
+) {
+    let store = match commands::open_store(config) {
+        Ok(s) => s,
+        Err(e) => {
+            report.check("open store for generations", false, &e.to_string());
+            return;
+        }
+    };
+    if repair {
+        match store.repair_generations(identity) {
+            Ok(report_repair) => {
+                report.note(&format!(
+                    "repaired .ks-generations ({} entries)",
+                    report_repair.entries
+                ));
+                if !report_repair.skipped.is_empty() {
+                    report.note(&format!(
+                        "skipped unreadable: {} — `ks rm <path>` then re-insert from known plaintext (not mv/cp/rotate)",
+                        report_repair.skipped.join(", ")
+                    ));
+                }
+            }
+            Err(e) => {
+                report.check("repair-generations", false, &e.to_string());
+                return;
+            }
+        }
+    }
+    match store.generation_census(identity) {
+        Ok(c) => {
+            report.check(
+                "generations fully protected",
+                c.fully_protected,
+                &format!(
+                    "sealed={} lag={} stale={} missing_index={} tombstones={}",
+                    c.sealed_count,
+                    c.lag_paths.len(),
+                    c.stale_paths.len(),
+                    c.missing_index.len(),
+                    c.tombstone_count
+                ),
+            );
+            if !c.lag_paths.is_empty() {
+                report.note(&format!(
+                    "generation lag on: {} (run doctor --repair-generations)",
+                    c.lag_paths.join(", ")
+                ));
+            }
+            if !c.stale_paths.is_empty() {
+                report.note(&format!(
+                    "stale (envelope < index) on: {} — single-device: doctor --repair-generations; multi-device durable: set known plaintext while index is still high (do not repair first)",
+                    c.stale_paths.join(", ")
+                ));
+            }
+        }
+        Err(e) => report.check("generations census", false, &e.to_string()),
+    }
+}
+
+fn note_pending_journals(config: &Config, report: &mut Report) {
+    let rotate = config.store_dir.join(".ks-rotate");
+    if rotate.join("READY").exists() {
+        report.note(
+            "interrupted recipient rotation (READY) pending unlock — doctor will recover when identity unlocks",
+        );
+    }
+    let mv = config.store_dir.join(".ks-move");
+    if mv.join("READY").exists() {
+        report.note(
+            "interrupted rename (READY) pending unlock — doctor will recover when identity unlocks",
+        );
+    }
+}
+
+fn recover_ready_journals(config: &Config, identity: &x25519::Identity, report: &mut Report) {
+    let store = match Store::open(config.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            report.check("open store for journal recover", false, &e.to_string());
+            return;
+        }
+    };
+    if config.store_dir.join(".ks-rotate").join("READY").exists() {
+        match store.recover_rotation(identity) {
+            Ok(ks::RotationRecovery::Completed) => {
+                report.note("recovered interrupted recipient rotation (authenticated READY)");
+            }
+            Ok(_) => {}
+            Err(e) => report.check("recover interrupted rotation", false, &e.to_string()),
+        }
+    }
+    if config.store_dir.join(".ks-move").join("READY").exists() {
+        match store.recover_move(identity) {
+            Ok(ks::MoveRecovery::Completed) => {
+                report.note("recovered interrupted rename (authenticated READY)");
+            }
+            Ok(_) => {}
+            Err(e) => report.check("recover interrupted rename", false, &e.to_string()),
+        }
+    }
+}
+
 fn finish(report: &Report) -> ExitCode {
     let ok = report.failures == 0;
     if crate::output::is_json() {
@@ -138,7 +304,6 @@ fn finish(report: &Report) -> ExitCode {
     }
 }
 
-/// Records git repo status as a note (human prints the full `git status -sb`).
 fn report_git(config: &Config, report: &mut Report) {
     if !git::is_repo(&config.store_dir) {
         report.note("git: not a repository");
@@ -163,10 +328,6 @@ fn report_git(config: &Config, report: &mut Report) {
     }
 }
 
-/// Verifies the identity unlocks and is present in the recipient list.
-///
-/// Skipped when neither `KS_PASSPHRASE` nor an interactive terminal is
-/// available, so `ks doctor` stays non-blocking in scripts and CI.
 fn check_identity(
     config: &Config,
     recipients_path: &Path,
@@ -197,7 +358,6 @@ fn check_identity(
     Some(identity)
 }
 
-/// Flags any identity/store/recipients path readable by group or other (Unix).
 fn check_permissions(config: &Config, report: &mut Report) {
     let issues = config.permission_issues();
     if !issues.is_empty() {
@@ -207,20 +367,25 @@ fn check_permissions(config: &Config, report: &mut Report) {
     } else if cfg!(unix) {
         report.check("file permissions owner-only", true, "ok");
     } else {
-        // No POSIX mode bits to inspect; report honestly rather than a false "ok".
         report.note("file permissions: not enforced on this platform (Windows ACLs out of scope)");
     }
 }
 
-/// Spot-checks that a sample of secrets decrypt and pass envelope verification,
-/// catching tampering, relocation, or legacy (pre-envelope) files.
 fn check_secrets(config: &Config, identity: &x25519::Identity, report: &mut Report) {
     const SAMPLE: usize = 20;
-    let Ok(store) = commands::open_store(config) else {
-        return;
+    let store = match commands::open_store(config) {
+        Ok(s) => s,
+        Err(e) => {
+            report.check("open store for secret sample", false, &e.to_string());
+            return;
+        }
     };
-    let Ok(paths) = store.list("") else {
-        return;
+    let paths = match store.list("") {
+        Ok(p) => p,
+        Err(e) => {
+            report.check("list secrets for sample", false, &e.to_string());
+            return;
+        }
     };
     if paths.is_empty() {
         return;
@@ -229,7 +394,7 @@ fn check_secrets(config: &Config, identity: &x25519::Identity, report: &mut Repo
     let bad = paths
         .iter()
         .take(SAMPLE)
-        .filter(|path| store.get(path, identity).is_err())
+        .filter(|path| commands::get_secret(&store, path, identity).is_err())
         .count();
     report.check(
         &format!("secrets decrypt & verify ({checked} sampled)"),
@@ -242,33 +407,6 @@ fn check_secrets(config: &Config, identity: &x25519::Identity, report: &mut Repo
     );
 }
 
-/// Detects and self-heals a recipient rotation that a crash interrupted, then
-/// reports what happened. Opening the store is what performs the recovery, so
-/// the remaining checks afterwards always see a consistent store.
-fn check_rotation(config: &Config, report: &mut Report) {
-    let staging = config.store_dir.join(".ks-rotate");
-    if !staging.exists() {
-        return;
-    }
-    let rolled_forward = staging.join("READY").exists();
-    match Store::open(config.clone()) {
-        Ok(_) => {
-            let action = if rolled_forward {
-                "rolled forward to completion"
-            } else {
-                "rolled back (store was untouched)"
-            };
-            report.note(&format!(
-                "recovered an interrupted recipient rotation: {action}"
-            ));
-        }
-        Err(e) => report.check("recover interrupted rotation", false, &e.to_string()),
-    }
-}
-
-/// Reports leftover scratch files from an interrupted atomic write as non-fatal
-/// notes with a cleanup hint. (Interrupted rotations are handled by
-/// [`check_rotation`], which self-heals them.)
 fn check_runtime_artifacts(config: &Config, report: &mut Report) {
     let temps = orphan_temp_count(&config.store_dir);
     if temps > 0 {
@@ -278,8 +416,6 @@ fn check_runtime_artifacts(config: &Config, report: &mut Report) {
     }
 }
 
-/// Counts `*.tmp` scratch files left by an interrupted atomic write, skipping
-/// dot-directories (`.git`, `.ks-rotate`, …).
 fn orphan_temp_count(root: &Path) -> usize {
     let mut count = 0;
     count_temps(root, &mut count);

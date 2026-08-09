@@ -75,9 +75,11 @@ pub enum Error {
     #[error("decryption failed: {0}")]
     Decrypt(String),
 
-    /// A secret failed its integrity check: the envelope is missing/unsupported
-    /// (a legacy or corrupt file) or its bound path does not match where the
-    /// file lives — possible tampering, a relocated file, or a rolled-back sync.
+    /// A secret failed its integrity check: missing/unsupported envelope,
+    /// bound path mismatch (relocated/swapped ciphertext), or envelope
+    /// generation older than the store index (property P1 — partial temporal
+    /// integrity). Does **not** detect co-rolled index + secret restores or
+    /// intentional full-commit / history checkout (non-property N1).
     #[error("integrity check failed for `{path}`: {reason}")]
     Tampered {
         /// The logical path the secret was read from.

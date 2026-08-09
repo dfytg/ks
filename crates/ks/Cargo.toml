@@ -13,6 +13,10 @@ categories.workspace = true
 [lib]
 name = "ks"
 
+[features]
+# Exposes `ks::fuzzing` helpers for external cargo-fuzz targets (optional).
+fuzzing = []
+
 [dependencies]
 age.workspace         = true
 directories.workspace = true

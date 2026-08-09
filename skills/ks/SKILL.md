@@ -10,7 +10,7 @@ description: >-
 
 # ks — Local-First Secret Manager
 
-`ks` is a single-binary CLI that keeps secrets in per-secret [`age`](https://age-encryption.org)-encrypted files under one passphrase-protected X25519 identity, synced with plain git. Encryption needs only public keys, so **writing never needs the passphrase**; only reading (and rotating recipients) unlocks the identity. Each secret is sealed in a versioned envelope bound to its logical path, so a relocated or tampered file is rejected on read.
+`ks` is a single-binary CLI that keeps secrets in per-secret [`age`](https://age-encryption.org)-encrypted files under one passphrase-protected X25519 identity, synced with plain git. Encryption needs only public keys, so **writing never needs the passphrase**; only reading (and rotating recipients / mv / cp) unlocks the identity. Each secret is sealed in a `ksenv/2` envelope bound to its **logical path and generation**. Relocated/swapped files are rejected (path binding). Older ciphertext under a newer generation index is rejected (P1). Restoring a coherent older secret **and** its index line (or a full old git commit) is **not** detected (N1).
 
 ## Installation
 
@@ -67,7 +67,7 @@ ks [--json] <command> [options]
 | `identity export`          |         | Back up the encrypted identity: `--out <path>` (file) or `--armor` (stdout)              | no               |
 | `identity import [path]`   |         | Restore the identity from a backup (file or stdin). `-f/--force` to overwrite            | passphrase       |
 | `sync [-m <msg>]`          |         | `git add -A` + commit + `pull --rebase` + push, in one step                              | no               |
-| `doctor`                   |         | Health-check the store (self-heals an interrupted rotation)                              | optional         |
+| `doctor [--repair-generations]` |    | Health-check (self-heals interrupted rotate/rename); optional index rebuild              | optional / repair |
 | `git <args…>`              |         | Run git inside the store (passthrough)                                                   | no               |
 | `edit <path>`              |         | Edit in `$EDITOR` (**interactive only**)                                                 | yes              |
 | `passwd`                   |         | Rotate the identity passphrase (**interactive only**)                                    | yes              |
@@ -149,7 +149,7 @@ Always use `--json` for programmatic use. Each command prints one object.
 // sync
 { "synced": true, "store_dir": "…", "message": "ks sync" }
 
-// doctor
+// doctor  (notes may include generation lag/stale, repair skips, hardening)
 { "checks": [ { "check": "identity unlocks", "ok": true, "detail": "…" } ],
   "notes": ["git: not a repository"], "failures": 0, "ok": true }
 
@@ -165,6 +165,7 @@ Always use `--json` for programmatic use. Each command prints one object.
 | `KS_DIR` / `KS_STORE_DIR` / `KS_IDENTITY` | Override store/identity paths                                                                                 |
 | `KS_CLIP_TIME`                            | Clipboard auto-clear seconds (default 45)                                                                     |
 | `KS_AUDIT`                                | `1` enables an append-only metadata audit log (`logs/audit.jsonl`)                                            |
+| `KS_STRICT_HARDEN`                        | `1` aborts startup if critical Unix hardening fails (core dump / debugger deny)                             |
 | `NO_COLOR`                                | Disable colour (already off under `--json` / pipes)                                                           |
 
 ## Exit Codes
@@ -174,8 +175,10 @@ Always use `--json` for programmatic use. Each command prints one object.
 ## Security Notes
 
 - **`show --json` returns plaintext secret values on stdout.** Treat that output as sensitive: do not log it, echo it into shell history, or persist it. Prefer capturing into a variable (`$(… | jq -r .value)`).
+- **`run` injects secrets via the child environment** — readable by same-user processes and inherited by descendants. Prefer it to a committed `.env`, not as a sandbox.
 - Success and error JSON both go to **stdout**; distinguish by the `error` key and the exit code.
 - `run` and `git` are passthrough: the child process / `git` owns stdout, so `--json` only affects _their errors_, not their normal output.
+- **Generation skew:** lag → `doctor --repair-generations`. Multi-device durable rewrite of a stale path: `set` known plaintext **while the high index is still present** (do not repair first). Unreadable secrets: `rm` then re-insert from known plaintext (not `mv`/`cp`/rotate).
 
 ## Agent Best Practices
 

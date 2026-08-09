@@ -105,7 +105,7 @@ pub enum Command {
         force: bool,
     },
 
-    /// Rename (move) a secret. Moves ciphertext only — no passphrase needed.
+    /// Rename (move) a secret. Decrypts, re-binds the path envelope, and re-encrypts (requires unlock).
     Mv {
         /// Current logical path.
         from: String,
@@ -113,7 +113,7 @@ pub enum Command {
         to: String,
     },
 
-    /// Copy a secret. Copies ciphertext only — no passphrase needed.
+    /// Copy a secret. Decrypts, re-binds the path envelope, and re-encrypts (requires unlock).
     Cp {
         /// Source logical path.
         from: String,
@@ -186,7 +186,11 @@ pub enum Command {
     },
 
     /// Run a battery of health checks on the store and config.
-    Doctor,
+    Doctor {
+        /// Rebuild `.ks-generations` from live envelopes (requires unlock; preserves tombstones).
+        #[arg(long)]
+        repair_generations: bool,
+    },
 
     /// Change the identity's passphrase.
     Passwd,

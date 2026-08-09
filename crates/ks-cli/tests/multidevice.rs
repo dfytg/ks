@@ -13,16 +13,20 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PASS: &str = "integration-pass-123456";
+
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ks-md-it-{}-{nanos}", std::process::id()));
+    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ks-md-it-{}-{}-{seq}", std::process::id(), nanos));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -245,4 +249,195 @@ fn sync_roundtrips_between_clones() {
 
     let shown = json(&b, &["--json", "show", "svc/token"], None);
     assert_eq!(shown["value"], "s3cr3t");
+}
+
+/// Two devices insert disjoint paths, sync via bare remote; both secrets readable
+/// on both sides after pull (generation index union+max must not conflict).
+#[test]
+fn sync_disjoint_paths_across_devices() {
+    if !git_available() {
+        eprintln!("skipping sync_disjoint_paths_across_devices: git is not installed");
+        return;
+    }
+
+    let remote = unique_dir().join("remote.git");
+    git_in(
+        Path::new("."),
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            remote.to_str().unwrap(),
+        ],
+    );
+
+    let a = unique_dir();
+    json(&a, &["--json", "init", "--git"], None);
+    let store_a = a.join("store");
+    git_in(&store_a, &["add", "-A"]);
+    git_in(&store_a, &["commit", "-m", "init store"]);
+    git_in(
+        &store_a,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git_in(&store_a, &["push", "-u", "origin", "main"]);
+
+    let backup = a.join("id.age");
+    json(
+        &a,
+        &[
+            "--json",
+            "identity",
+            "export",
+            "--out",
+            backup.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    let b = unique_dir();
+    git_in(
+        Path::new("."),
+        &[
+            "clone",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+            b.join("store").to_str().unwrap(),
+        ],
+    );
+    json(
+        &b,
+        &["--json", "identity", "import", backup.to_str().unwrap()],
+        None,
+    );
+
+    json(
+        &a,
+        &["--json", "insert", "a/only", "--multiline"],
+        Some(b"from-a\n"),
+    );
+    json(&a, &["--json", "sync", "-m", "a only"], None);
+
+    // B pulls, adds a different path, pushes.
+    json(&b, &["--json", "sync", "-m", "pull a"], None);
+    json(
+        &b,
+        &["--json", "insert", "b/only", "--multiline"],
+        Some(b"from-b\n"),
+    );
+    json(&b, &["--json", "sync", "-m", "b only"], None);
+
+    // A pulls B's secret.
+    json(&a, &["--json", "sync", "-m", "pull b"], None);
+
+    assert_eq!(
+        json(&a, &["--json", "show", "a/only"], None)["value"],
+        "from-a"
+    );
+    assert_eq!(
+        json(&a, &["--json", "show", "b/only"], None)["value"],
+        "from-b"
+    );
+    assert_eq!(
+        json(&b, &["--json", "show", "a/only"], None)["value"],
+        "from-a"
+    );
+    assert_eq!(
+        json(&b, &["--json", "show", "b/only"], None)["value"],
+        "from-b"
+    );
+}
+
+/// Delete then re-insert the same path (tombstone floor): after sync, no false
+/// Tampered from multi-device max-reduce of generation index.
+#[test]
+fn sync_delete_reinsert_tombstone_floor() {
+    if !git_available() {
+        eprintln!("skipping sync_delete_reinsert_tombstone_floor: git is not installed");
+        return;
+    }
+
+    let remote = unique_dir().join("remote.git");
+    git_in(
+        Path::new("."),
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            remote.to_str().unwrap(),
+        ],
+    );
+
+    let a = unique_dir();
+    json(&a, &["--json", "init", "--git"], None);
+    let store_a = a.join("store");
+    git_in(&store_a, &["add", "-A"]);
+    git_in(&store_a, &["commit", "-m", "init store"]);
+    git_in(
+        &store_a,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git_in(&store_a, &["push", "-u", "origin", "main"]);
+
+    json(
+        &a,
+        &["--json", "insert", "svc/token", "--multiline"],
+        Some(b"v1\n"),
+    );
+    // Bump generation a few times so the tombstone floor is > 1.
+    json(
+        &a,
+        &["--json", "insert", "svc/token", "--force", "--multiline"],
+        Some(b"v2\n"),
+    );
+    json(
+        &a,
+        &["--json", "insert", "svc/token", "--force", "--multiline"],
+        Some(b"v3\n"),
+    );
+    json(&a, &["--json", "sync", "-m", "seed"], None);
+
+    let backup = a.join("id.age");
+    json(
+        &a,
+        &[
+            "--json",
+            "identity",
+            "export",
+            "--out",
+            backup.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    let b = unique_dir();
+    git_in(
+        Path::new("."),
+        &[
+            "clone",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+            b.join("store").to_str().unwrap(),
+        ],
+    );
+    json(
+        &b,
+        &["--json", "identity", "import", backup.to_str().unwrap()],
+        None,
+    );
+
+    // B deletes and re-inserts (tombstone floor continues generation).
+    json(&b, &["--json", "rm", "svc/token", "--force"], None);
+    json(
+        &b,
+        &["--json", "insert", "svc/token", "--multiline"],
+        Some(b"after-rm\n"),
+    );
+    json(&b, &["--json", "sync", "-m", "reinsert"], None);
+
+    json(&a, &["--json", "sync", "-m", "pull reinsert"], None);
+    let shown = json(&a, &["--json", "show", "svc/token"], None);
+    assert_eq!(shown["value"], "after-rm");
 }

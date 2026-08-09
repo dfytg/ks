@@ -74,7 +74,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Identity { action } => identity::run(cfg, action),
         Command::Git { args } => git::run(cfg, &args),
         Command::Sync { message } => sync::run(cfg, &message),
-        Command::Doctor => Ok(doctor::run(cfg)),
+        Command::Doctor { repair_generations } => Ok(doctor::run(cfg, repair_generations)),
         Command::Passwd => passwd::run(cfg),
     };
     crate::audit::record(cfg, op, &target, result.is_ok());
@@ -102,7 +102,7 @@ fn audit_descriptor(command: &Command) -> (&'static str, String) {
         Command::Identity { .. } => ("identity", String::new()),
         Command::Git { .. } => ("git", String::new()),
         Command::Sync { .. } => ("sync", String::new()),
-        Command::Doctor => ("doctor", String::new()),
+        Command::Doctor { .. } => ("doctor", String::new()),
         Command::Passwd => ("passwd", String::new()),
     }
 }
@@ -134,6 +134,15 @@ pub fn unlock(config: &Config) -> Result<x25519::Identity> {
 /// See [`Store::open`].
 pub fn open_store(config: &Config) -> Result<Store> {
     Store::open(config.clone())
+}
+
+/// Reads a secret with strict P1 checks (older envelope under newer index →
+/// [`ks::Error::Tampered`]).
+///
+/// # Errors
+/// See [`Store::get`].
+pub fn get_secret(store: &Store, path: &str, identity: &x25519::Identity) -> Result<ks::Secret> {
+    store.get(path, identity)
 }
 
 /// Clipboard auto-clear delay in seconds, from `KS_CLIP_TIME` (default 45).

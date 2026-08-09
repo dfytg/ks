@@ -11,7 +11,7 @@ use crate::terminal;
 pub fn run(config: &Config, path: &str, copy: bool) -> Result<ExitCode> {
     let store = commands::open_store(config)?;
     let identity = commands::unlock(config)?;
-    let secret = store.get(path, &identity)?;
+    let secret = commands::get_secret(&store, path, &identity)?;
 
     let source = secret
         .otp()
