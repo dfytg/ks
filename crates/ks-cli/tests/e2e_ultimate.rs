@@ -161,6 +161,11 @@ fn run_env(
     cmd.args(args)
         .env("KS_DIR", dir)
         .env_remove("KS_STRICT_HARDEN")
+        // So `ks sync` / git passthrough work on bare CI runners with no global identity.
+        .env("GIT_AUTHOR_NAME", "ks test")
+        .env("GIT_AUTHOR_EMAIL", "ks@example.com")
+        .env("GIT_COMMITTER_NAME", "ks test")
+        .env("GIT_COMMITTER_EMAIL", "ks@example.com")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
