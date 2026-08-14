@@ -34,7 +34,7 @@ arboard     = "3"
 # Agent-friendly JSON output (ks-cli only; the library stays serde-free).
 serde_json  = "1"
 # Match age's base64 0.21 so the lockfile does not carry two major lines.
-base64      = "0.21"
+base64      = "0.23"
 
 # Platform hardening (process-level, target-gated in the consuming crate).
 libc        = "0.2"
